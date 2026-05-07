@@ -30,6 +30,8 @@ UNSAFE_USER_ID_CHAR_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 def app_dir():
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin" and ".app/Contents/MacOS" in sys.executable:
+            return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 

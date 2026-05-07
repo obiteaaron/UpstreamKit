@@ -1,0 +1,50 @@
+name: Build macOS package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build DMG
+        run: |
+          chmod +x build_mac.sh
+          ./build_mac.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UpstreamKit-macOS
+          path: |
+            dist/UpstreamKit.dmg
+            dist/UpstreamKit.app
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" dist/UpstreamKit.dmg --clobber
+          else
+            gh release create "$TAG_NAME" dist/UpstreamKit.dmg \
+              --title "UpstreamKit ${TAG_NAME}" \
+              --notes "macOS package: download UpstreamKit.dmg from the assets below."
+          fi

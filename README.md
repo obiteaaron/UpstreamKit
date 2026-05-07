@@ -15,3 +15,35 @@
 - 在调用处配置url    
 - key和模型id随便填
 - 开始使用  
+
+## Windows 打包
+
+```powershell
+.\build_exe.ps1
+```
+
+输出：
+
+```text
+dist\UpstreamKit.exe
+```
+
+## macOS 打包
+
+macOS 安装包需要在 Mac 上打包，Windows 不能直接生成可用的 `.app/.dmg`。
+
+在 Mac 上执行：
+
+```bash
+chmod +x build_mac.sh
+./build_mac.sh
+```
+
+输出：
+
+```text
+dist/UpstreamKit.app
+dist/UpstreamKit.dmg
+```
+
+macOS 版本运行后，`config.json` 和 `token_stats.json` 会保存在 `UpstreamKit.app` 同级目录。
