@@ -1,5 +1,6 @@
 import json
 import os
+import argparse
 import queue
 import re
 import sys
@@ -873,7 +874,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 class RelayApp:
-    def __init__(self):
+    def __init__(self, autostart=False):
         self.root = Tk()
         self.root.title(APP_NAME)
         self.root.geometry("860x620")
@@ -897,6 +898,7 @@ class RelayApp:
         self.tray_icon = None
         self.tray_thread = None
         self.exiting = False
+        self.autostart = autostart
         self.close_hint_logged = False
         self.log_queue = queue.Queue()
         self.log_lines = []
@@ -1198,6 +1200,8 @@ class RelayApp:
             self.log_text.configure(state=DISABLED)
             self.log_text.see(END)
         self.root.after(100, self.flush_logs)
+        if self.autostart:
+            self.root.after(500, self.start_server)
 
     def run(self):
         self.log("程序已就绪")
@@ -1207,4 +1211,7 @@ class RelayApp:
 
 
 if __name__ == "__main__":
-    RelayApp().run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--autostart", action="store_true", help="启动后自动开始中转服务")
+    args = parser.parse_args()
+    RelayApp(autostart=args.autostart).run()
