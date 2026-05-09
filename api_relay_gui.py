@@ -1,6 +1,8 @@
 import json
 import os
 import argparse
+import atexit
+import tempfile
 import queue
 import re
 import sys
@@ -875,6 +877,22 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 class RelayApp:
     def __init__(self, autostart=False):
+        # 单实例保护
+        self._lockfile = os.path.join(tempfile.gettempdir(), "UpstreamKit.lock")
+        if os.path.exists(self._lockfile):
+            try:
+                with open(self._lockfile, "r") as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)  # 检查进程是否存在
+                self.log = lambda _: None  # 占位
+                print(f"UpstreamKit 已在运行 (PID {old_pid})，退出。")
+                sys.exit(0)
+            except (OSError, ValueError):
+                os.remove(self._lockfile)  # 僵尸锁，清理
+        with open(self._lockfile, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(lambda: os.path.exists(self._lockfile) and os.remove(self._lockfile))
+        #单实例保护结束
         self.root = Tk()
         self.root.title(APP_NAME)
         self.root.geometry("860x620")
@@ -1169,6 +1187,11 @@ class RelayApp:
         self.root.focus_force()
 
     def exit_app(self):
+        if os.path.exists(self._lockfile):
+            try:
+                os.remove(self._lockfile)
+            except:
+                pass
         if self.exiting:
             return
         self.exiting = True
