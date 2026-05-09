@@ -1124,6 +1124,8 @@ class RelayApp:
             self.root.after(0, lambda: self.test_button.configure(state=NORMAL))
 
     def start_server(self):
+        if self.server:
+            return
         try:
             self.save_current_config()
             config = self.read_config_from_form()
@@ -1223,13 +1225,14 @@ class RelayApp:
             self.log_text.configure(state=DISABLED)
             self.log_text.see(END)
         self.root.after(100, self.flush_logs)
-        if self.autostart:
-            self.root.after(500, self.start_server)
 
     def run(self):
         self.log("程序已就绪")
         self.log(f"配置文件：{CONFIG_PATH}")
         self.log(f"token统计文件：{TOKEN_STATS_PATH}")
+        self.root.after(100, self.flush_logs)
+        if self.autostart:
+            self.root.after(500, self.start_server)
         self.root.mainloop()
 
 
