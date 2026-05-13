@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, WORD, ttk
 
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
+
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -27,6 +32,7 @@ except ImportError:
 APP_NAME = "UpstreamKit"
 DEFAULT_PORT = "8787"
 LOG_PREVIEW_LIMIT = 1200
+RUN_REGISTRY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 SAFE_USER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 UNSAFE_USER_ID_CHAR_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
@@ -37,6 +43,42 @@ def app_dir():
             return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def quote_command_arg(value):
+    return '"' + value.replace('"', r'\"') + '"'
+
+
+def startup_command():
+    if getattr(sys, "frozen", False):
+        return f"{quote_command_arg(sys.executable)} --autostart"
+    return f"{quote_command_arg(sys.executable)} {quote_command_arg(os.path.abspath(__file__))} --autostart"
+
+
+def is_startup_enabled():
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REGISTRY_PATH, 0, winreg.KEY_READ) as key:
+            value, _ = winreg.QueryValueEx(key, APP_NAME)
+        return value == startup_command()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled):
+    if winreg is None:
+        raise RuntimeError("开机自启仅支持 Windows")
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_REGISTRY_PATH, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
 
 
 CONFIG_DIR = app_dir()
@@ -1169,8 +1211,25 @@ class RelayApp:
         def exit_action(_icon=None, _item=None):
             self.root.after(0, self.exit_app)
 
+        def startup_text(_item=None):
+            return "√ 开机自启" if is_startup_enabled() else "x 开机不自启"
+
+        def toggle_startup(_icon=None, _item=None):
+            def do_toggle():
+                try:
+                    enabled = not is_startup_enabled()
+                    set_startup_enabled(enabled)
+                    self.log("已开启开机自启" if enabled else "已关闭开机自启")
+                    if self.tray_icon:
+                        self.tray_icon.update_menu()
+                except Exception as exc:
+                    self.log(f"设置开机自启失败：{exc}")
+
+            self.root.after(0, do_toggle)
+
         menu = pystray.Menu(
             pystray.MenuItem("显示窗口", show_action, default=True),
+            pystray.MenuItem(startup_text, toggle_startup, enabled=winreg is not None),
             pystray.MenuItem("退出", exit_action),
         )
         self.tray_icon = pystray.Icon("UpstreamKit", create_tray_image(), APP_NAME, menu)
