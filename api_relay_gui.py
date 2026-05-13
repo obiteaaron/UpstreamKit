@@ -1,5 +1,8 @@
 import json
 import os
+import argparse
+import atexit
+import tempfile
 import queue
 import re
 import sys
@@ -873,7 +876,23 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 class RelayApp:
-    def __init__(self):
+    def __init__(self, autostart=False):
+        # 单实例保护
+        self._lockfile = os.path.join(tempfile.gettempdir(), "UpstreamKit.lock")
+        if os.path.exists(self._lockfile):
+            try:
+                with open(self._lockfile, "r") as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 0)  # 检查进程是否存在
+                self.log = lambda _: None  # 占位
+                print(f"UpstreamKit 已在运行 (PID {old_pid})，退出。")
+                sys.exit(0)
+            except (OSError, ValueError):
+                os.remove(self._lockfile)  # 僵尸锁，清理
+        with open(self._lockfile, "w") as f:
+            f.write(str(os.getpid()))
+        atexit.register(lambda: os.path.exists(self._lockfile) and os.remove(self._lockfile))
+        #单实例保护结束
         self.root = Tk()
         self.root.title(APP_NAME)
         self.root.geometry("860x620")
@@ -897,6 +916,7 @@ class RelayApp:
         self.tray_icon = None
         self.tray_thread = None
         self.exiting = False
+        self.autostart = autostart
         self.close_hint_logged = False
         self.log_queue = queue.Queue()
         self.log_lines = []
@@ -1104,6 +1124,8 @@ class RelayApp:
             self.root.after(0, lambda: self.test_button.configure(state=NORMAL))
 
     def start_server(self):
+        if self.server:
+            return
         try:
             self.save_current_config()
             config = self.read_config_from_form()
@@ -1167,6 +1189,11 @@ class RelayApp:
         self.root.focus_force()
 
     def exit_app(self):
+        if os.path.exists(self._lockfile):
+            try:
+                os.remove(self._lockfile)
+            except:
+                pass
         if self.exiting:
             return
         self.exiting = True
@@ -1203,8 +1230,14 @@ class RelayApp:
         self.log("程序已就绪")
         self.log(f"配置文件：{CONFIG_PATH}")
         self.log(f"token统计文件：{TOKEN_STATS_PATH}")
+        self.root.after(100, self.flush_logs)
+        if self.autostart:
+            self.root.after(500, self.start_server)
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    RelayApp().run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--autostart", action="store_true", help="启动后自动开始中转服务")
+    args = parser.parse_args()
+    RelayApp(autostart=args.autostart).run()
