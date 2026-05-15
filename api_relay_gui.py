@@ -5,6 +5,7 @@ import atexit
 import tempfile
 import queue
 import re
+import ssl
 import sys
 import threading
 import time
@@ -19,6 +20,16 @@ if sys.platform == "win32":
     import winreg
 else:
     winreg = None
+
+try:
+    import truststore
+except ImportError:
+    truststore = None
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 try:
     import pystray
@@ -43,6 +54,19 @@ def app_dir():
             return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(sys.executable))))
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def configure_ssl_trust():
+    if truststore is not None:
+        try:
+            truststore.inject_into_ssl()
+            return "system"
+        except Exception:
+            pass
+    if certifi is not None:
+        ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+        return "certifi"
+    return "default"
 
 
 def quote_command_arg(value):
@@ -84,6 +108,7 @@ def set_startup_enabled(enabled):
 CONFIG_DIR = app_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "token_stats.json")
+SSL_TRUST_SOURCE = configure_ssl_trust()
 DEFAULT_CONFIG = {
     "provider": "openai",
     "base_url": "https://api.openai.com",
@@ -1289,6 +1314,7 @@ class RelayApp:
         self.log("程序已就绪")
         self.log(f"配置文件：{CONFIG_PATH}")
         self.log(f"token统计文件：{TOKEN_STATS_PATH}")
+        self.log(f"证书信任来源：{SSL_TRUST_SOURCE}")
         self.root.after(100, self.flush_logs)
         if self.autostart:
             self.root.after(500, self.start_server)
