@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, WORD, ttk
+from tkinter import END, DISABLED, NORMAL, StringVar, Text, Tk, Toplevel, WORD, ttk
 
 if sys.platform == "win32":
     import winreg
@@ -109,11 +109,16 @@ CONFIG_DIR = app_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "token_stats.json")
 SSL_TRUST_SOURCE = configure_ssl_trust()
-DEFAULT_CONFIG = {
+DEFAULT_UPSTREAM = {
+    "name": "默认上游",
     "provider": "openai",
     "base_url": "https://api.openai.com",
     "api_key": "",
     "model": "gpt-4.1",
+}
+DEFAULT_CONFIG = {
+    "upstreams": [dict(DEFAULT_UPSTREAM)],
+    "active_upstream": 0,
     "port": DEFAULT_PORT,
 }
 DEFAULT_TOKEN_STATS = {
@@ -260,8 +265,23 @@ def load_saved_config():
         with open(CONFIG_PATH, "r", encoding="utf-8") as file:
             data = json.load(file)
         if isinstance(data, dict):
+            # 旧格式配置迁移
+            if "upstreams" not in data and "provider" in data:
+                migrated = dict(DEFAULT_CONFIG)
+                migrated["upstreams"] = [{
+                    "name": data.get("name", "迁移的上游"),
+                    "provider": data.get("provider", "openai"),
+                    "base_url": data.get("base_url", "https://api.openai.com"),
+                    "api_key": data.get("api_key", ""),
+                    "model": data.get("model", "gpt-4.1"),
+                }]
+                migrated["port"] = data.get("port", DEFAULT_PORT)
+                save_config_data(migrated)
+                return migrated
             merged = dict(DEFAULT_CONFIG)
             merged.update(data)
+            if not merged.get("upstreams"):
+                merged["upstreams"] = [dict(DEFAULT_UPSTREAM)]
             return merged
     except Exception:
         return dict(DEFAULT_CONFIG)
@@ -942,6 +962,67 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.server.state.log(summary)
 
 
+class UpstreamEditDialog:
+    def __init__(self, parent, title, initial=None):
+        self.result = None
+        self.dialog = Toplevel(parent)
+        self.dialog.title(title)
+        self.dialog.geometry("420x280")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        frame = ttk.Frame(self.dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        initial = initial or dict(DEFAULT_UPSTREAM)
+
+        self.name_var = StringVar(value=initial.get("name", "新上游"))
+        self.provider_var = StringVar(value=initial.get("provider", "openai"))
+        self.url_var = StringVar(value=initial.get("base_url", "https://api.openai.com"))
+        self.key_var = StringVar(value=initial.get("api_key", ""))
+        self.model_var = StringVar(value=initial.get("model", "gpt-4.1"))
+
+        ttk.Label(frame, text="名称").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.name_var, width=40).grid(row=0, column=1, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="类型").grid(row=1, column=0, sticky="w", pady=6)
+        provider_box = ttk.Combobox(frame, textvariable=self.provider_var, values=["openai", "anthropic"], state="readonly", width=18)
+        provider_box.grid(row=1, column=1, sticky="w", pady=6)
+
+        ttk.Label(frame, text="URL").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.url_var, width=40).grid(row=2, column=1, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="Key").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.key_var, show="*", width=40).grid(row=3, column=1, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="模型").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.model_var, width=40).grid(row=4, column=1, sticky="ew", pady=6)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=5, column=0, columnspan=2, sticky="e", pady=14)
+        ttk.Button(btn_frame, text="确定", command=self.on_ok, width=10).pack(side="left", padx=6)
+        ttk.Button(btn_frame, text="取消", command=self.on_cancel, width=10).pack(side="left", padx=6)
+
+        frame.columnconfigure(1, weight=1)
+        self.dialog.wait_window()
+
+    def on_ok(self):
+        name = self.name_var.get().strip()
+        if not name:
+            name = "未命名上游"
+        self.result = {
+            "name": name,
+            "provider": self.provider_var.get(),
+            "base_url": self.url_var.get().strip(),
+            "api_key": self.key_var.get().strip(),
+            "model": self.model_var.get().strip(),
+        }
+        self.dialog.destroy()
+
+    def on_cancel(self):
+        self.dialog.destroy()
+
+
 class RelayApp:
     def __init__(self, autostart=False):
         # 单实例保护
@@ -966,10 +1047,16 @@ class RelayApp:
         self.root.minsize(760, 560)
 
         self.saved_config = load_saved_config()
-        self.provider_var = StringVar(value=self.saved_config.get("provider", "openai"))
-        self.url_var = StringVar(value=self.saved_config.get("base_url", "https://api.openai.com"))
-        self.key_var = StringVar(value=self.saved_config.get("api_key", ""))
-        self.model_var = StringVar(value=self.saved_config.get("model", "gpt-4.1"))
+        self.upstreams = self.saved_config.get("upstreams", [dict(DEFAULT_UPSTREAM)])
+        self.active_upstream = self.saved_config.get("active_upstream", 0)
+        if self.active_upstream >= len(self.upstreams):
+            self.active_upstream = 0
+        active = self.upstreams[self.active_upstream] if self.upstreams else dict(DEFAULT_UPSTREAM)
+        self.upstream_var = StringVar(value=active.get("name", "默认上游"))
+        self.provider_var = StringVar(value=active.get("provider", "openai"))
+        self.url_var = StringVar(value=active.get("base_url", "https://api.openai.com"))
+        self.key_var = StringVar(value=active.get("api_key", ""))
+        self.model_var = StringVar(value=active.get("model", "gpt-4.1"))
         self.port_var = StringVar(value=str(self.saved_config.get("port", DEFAULT_PORT)))
         self.output_var = StringVar(value="未运行")
         self.session_tokens = dict(DEFAULT_TOKEN_STATS)
@@ -990,56 +1077,77 @@ class RelayApp:
 
         self.build_ui()
         self.update_token_labels()
-        self.setup_config_autosave()
+        self.port_var.trace_add("write", self.schedule_port_save)
         self.start_tray_icon()
         self.root.after(100, self.flush_logs)
+
+    def schedule_port_save(self, *_args):
+        if hasattr(self, "port_save_id") and self.port_save_id:
+            self.root.after_cancel(self.port_save_id)
+        self.port_save_id = self.root.after(500, self.save_config)
 
     def build_ui(self):
         frame = ttk.Frame(self.root, padding=14)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="上游 URL").grid(row=0, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.url_var).grid(row=0, column=1, columnspan=3, sticky="ew", pady=6)
+        # 上游选择器
+        ttk.Label(frame, text="上游配置").grid(row=0, column=0, sticky="w", pady=6)
+        self.upstream_box = ttk.Combobox(frame, textvariable=self.upstream_var, state="readonly", width=28)
+        self.upstream_box.grid(row=0, column=1, columnspan=2, sticky="ew", pady=6)
+        self.upstream_box.bind("<<ComboboxSelected>>", self.on_upstream_select)
+        self.refresh_upstream_box()
 
-        ttk.Label(frame, text="上游 Key").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.key_var, show="*").grid(row=1, column=1, columnspan=3, sticky="ew", pady=6)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=0, column=3, sticky="e", pady=6)
+        ttk.Button(btn_frame, text="添加", command=self.add_upstream, width=6).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="编辑", command=self.edit_upstream, width=6).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="删除", command=self.delete_upstream, width=6).pack(side="left", padx=2)
 
-        ttk.Label(frame, text="上游类型").grid(row=2, column=0, sticky="w", pady=6)
-        provider_box = ttk.Combobox(frame, textvariable=self.provider_var, values=["openai", "anthropic"], state="readonly", width=18)
-        provider_box.grid(row=2, column=1, sticky="w", pady=6)
-        provider_box.bind("<<ComboboxSelected>>", self.on_provider_change)
+        # 当前上游信息（只读显示）
+        ttk.Label(frame, text="上游 URL").grid(row=1, column=0, sticky="w", pady=6)
+        self.url_entry = ttk.Entry(frame, textvariable=self.url_var, state="readonly")
+        self.url_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=6)
 
-        ttk.Label(frame, text="上游模型（实际请求）").grid(row=2, column=2, sticky="e", pady=6)
-        ttk.Entry(frame, textvariable=self.model_var, width=28).grid(row=2, column=3, sticky="ew", pady=6)
+        ttk.Label(frame, text="上游 Key").grid(row=2, column=0, sticky="w", pady=6)
+        self.key_entry = ttk.Entry(frame, textvariable=self.key_var, show="*", state="readonly")
+        self.key_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=6)
 
-        ttk.Label(frame, text="本地端口").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(frame, textvariable=self.port_var, width=18).grid(row=3, column=1, sticky="w", pady=6)
+        ttk.Label(frame, text="上游类型").grid(row=3, column=0, sticky="w", pady=6)
+        self.provider_entry = ttk.Entry(frame, textvariable=self.provider_var, state="readonly", width=18)
+        self.provider_entry.grid(row=3, column=1, sticky="w", pady=6)
+
+        ttk.Label(frame, text="上游模型").grid(row=3, column=2, sticky="e", pady=6)
+        self.model_entry = ttk.Entry(frame, textvariable=self.model_var, state="readonly", width=28)
+        self.model_entry.grid(row=3, column=3, sticky="ew", pady=6)
+
+        ttk.Label(frame, text="本地端口").grid(row=4, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.port_var, width=18).grid(row=4, column=1, sticky="w", pady=6)
 
         self.run_button = ttk.Button(frame, text="运行", command=self.toggle_server)
-        self.run_button.grid(row=3, column=3, sticky="e", pady=6)
+        self.run_button.grid(row=4, column=3, sticky="e", pady=6)
 
         self.test_button = ttk.Button(frame, text="测试", command=self.test_upstream)
-        self.test_button.grid(row=4, column=3, sticky="e", pady=6)
+        self.test_button.grid(row=5, column=3, sticky="e", pady=6)
 
         sep = ttk.Separator(frame)
-        sep.grid(row=5, column=0, columnspan=4, sticky="ew", pady=12)
+        sep.grid(row=6, column=0, columnspan=4, sticky="ew", pady=12)
 
-        ttk.Label(frame, text="请求中转的 URL").grid(row=6, column=0, sticky="nw", pady=6)
+        ttk.Label(frame, text="请求中转的 URL").grid(row=7, column=0, sticky="nw", pady=6)
         output = ttk.Entry(frame, textvariable=self.output_var, state="readonly")
-        output.grid(row=6, column=1, columnspan=3, sticky="ew", pady=6)
+        output.grid(row=7, column=1, columnspan=3, sticky="ew", pady=6)
 
         info = "Claude Code 开发者模式里填上方 URL；Key 可留空或随便填；客户端传来的 model 会被忽略，思考参数会保留。"
-        ttk.Label(frame, text=info).grid(row=7, column=1, columnspan=3, sticky="w", pady=3)
+        ttk.Label(frame, text=info).grid(row=8, column=1, columnspan=3, sticky="w", pady=3)
 
-        ttk.Label(frame, text="本次开启token：").grid(row=8, column=0, sticky="nw", pady=(10, 2))
-        ttk.Label(frame, textvariable=self.session_token_var).grid(row=8, column=1, columnspan=3, sticky="w", pady=(10, 2))
+        ttk.Label(frame, text="本次开启token：").grid(row=9, column=0, sticky="nw", pady=(10, 2))
+        ttk.Label(frame, textvariable=self.session_token_var).grid(row=9, column=1, columnspan=3, sticky="w", pady=(10, 2))
 
-        ttk.Label(frame, text="总计token：").grid(row=9, column=0, sticky="nw", pady=2)
-        ttk.Label(frame, textvariable=self.total_token_var).grid(row=9, column=1, columnspan=3, sticky="w", pady=2)
+        ttk.Label(frame, text="总计token：").grid(row=10, column=0, sticky="nw", pady=2)
+        ttk.Label(frame, textvariable=self.total_token_var).grid(row=10, column=1, columnspan=3, sticky="w", pady=2)
 
-        ttk.Label(frame, text="日志").grid(row=10, column=0, sticky="nw", pady=(14, 6))
+        ttk.Label(frame, text="日志").grid(row=11, column=0, sticky="nw", pady=(14, 6))
         log_frame = ttk.Frame(frame)
-        log_frame.grid(row=10, column=1, columnspan=3, sticky="nsew", pady=(14, 0))
+        log_frame.grid(row=11, column=1, columnspan=3, sticky="nsew", pady=(14, 0))
 
         self.log_text = Text(log_frame, wrap=WORD, height=15, state=DISABLED)
         scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
@@ -1049,26 +1157,76 @@ class RelayApp:
 
         frame.columnconfigure(1, weight=1)
         frame.columnconfigure(3, weight=1)
-        frame.rowconfigure(10, weight=1)
+        frame.rowconfigure(11, weight=1)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def setup_config_autosave(self):
-        for var in (self.provider_var, self.url_var, self.key_var, self.model_var, self.port_var):
-            var.trace_add("write", self.schedule_config_save)
+    def refresh_upstream_box(self):
+        names = [u.get("name", f"上游{i+1}") for i, u in enumerate(self.upstreams)]
+        self.upstream_box["values"] = names
+        if 0 <= self.active_upstream < len(names):
+            self.upstream_box.current(self.active_upstream)
 
-    def schedule_config_save(self, *_args):
-        if hasattr(self, "save_after_id") and self.save_after_id:
-            self.root.after_cancel(self.save_after_id)
-        self.save_after_id = self.root.after(500, self.save_current_config)
+    def on_upstream_select(self, _event=None):
+        idx = self.upstream_box.current()
+        if idx >= 0 and idx != self.active_upstream:
+            self.switch_upstream(idx)
 
-    def save_current_config(self):
-        self.save_after_id = None
+    def switch_upstream(self, idx):
+        was_running = self.server is not None
+        if was_running:
+            self.stop_server()
+        self.active_upstream = idx
+        if self.active_upstream >= len(self.upstreams):
+            self.active_upstream = 0
+        active = self.upstreams[self.active_upstream] if self.upstreams else dict(DEFAULT_UPSTREAM)
+        self.upstream_var.set(active.get("name", "默认上游"))
+        self.provider_var.set(active.get("provider", "openai"))
+        self.url_var.set(active.get("base_url", "https://api.openai.com"))
+        self.key_var.set(active.get("api_key", ""))
+        self.model_var.set(active.get("model", "gpt-4.1"))
+        self.log(f"已切换到上游：{active.get('name', '默认上游')}")
+        self.save_config()
+        if was_running:
+            self.start_server()
+
+    def add_upstream(self):
+        dialog = UpstreamEditDialog(self.root, "添加上游")
+        if dialog.result:
+            self.upstreams.append(dialog.result)
+            self.active_upstream = len(self.upstreams) - 1
+            self.refresh_upstream_box()
+            self.on_upstream_select(None)
+            self.log(f"已添加上游：{dialog.result.get('name', '新上游')}")
+            self.save_config()
+
+    def edit_upstream(self):
+        if not self.upstreams:
+            return
+        dialog = UpstreamEditDialog(self.root, "编辑上游", self.upstreams[self.active_upstream])
+        if dialog.result:
+            self.upstreams[self.active_upstream] = dialog.result
+            self.refresh_upstream_box()
+            self.on_upstream_select(None)
+            self.log(f"已编辑上游：{dialog.result.get('name', '上游')}")
+            self.save_config()
+
+    def delete_upstream(self):
+        if len(self.upstreams) <= 1:
+            self.log("至少需要保留一个上游配置")
+            return
+        name = self.upstreams[self.active_upstream].get("name", "上游")
+        self.upstreams.pop(self.active_upstream)
+        self.active_upstream = min(self.active_upstream, len(self.upstreams) - 1)
+        self.refresh_upstream_box()
+        self.on_upstream_select(None)
+        self.log(f"已删除上游：{name}")
+        self.save_config()
+
+    def save_config(self):
         data = {
-            "provider": self.provider_var.get(),
-            "base_url": self.url_var.get(),
-            "api_key": self.key_var.get(),
-            "model": self.model_var.get(),
+            "upstreams": self.upstreams,
+            "active_upstream": self.active_upstream,
             "port": self.port_var.get(),
         }
         try:
@@ -1102,16 +1260,6 @@ class RelayApp:
                 self.log(f"保存 token 统计失败：{exc}")
         self.root.after(0, self.update_token_labels)
 
-    def on_provider_change(self, _event=None):
-        if self.provider_var.get() == "anthropic":
-            if "openai.com" in self.url_var.get():
-                self.url_var.set("https://api.anthropic.com")
-            if self.model_var.get() == "gpt-4.1":
-                self.model_var.set("claude-3-5-sonnet-latest")
-        else:
-            if "anthropic.com" in self.url_var.get():
-                self.url_var.set("https://api.openai.com")
-
     def toggle_server(self):
         if self.server:
             self.stop_server()
@@ -1127,7 +1275,7 @@ class RelayApp:
         if not self.key_var.get().strip():
             raise ValueError("请填写上游 Key")
         if not self.model_var.get().strip():
-            raise ValueError("请填写上游模型（实际请求）")
+            raise ValueError("请填写上游模型")
         return RelayConfig(
             provider=self.provider_var.get(),
             base_url=self.url_var.get().strip(),
@@ -1194,7 +1342,7 @@ class RelayApp:
         if self.server:
             return
         try:
-            self.save_current_config()
+            self.save_config()
             config = self.read_config_from_form()
             state = RelayState(config, self.log, self.record_token_usage)
             server = ThreadingHTTPServer(("127.0.0.1", config.port), RelayHandler)
