@@ -1,12 +1,15 @@
 import json
 import os
 import re
+import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -146,6 +149,147 @@ def post_json(url, headers, body, timeout=60):
     except urllib.error.HTTPError as err:
         data = err.read()
         return err.code, data.decode("utf-8", errors="replace")
+
+
+def unwrap_url_error(exc):
+    if isinstance(exc, urllib.error.URLError) and getattr(exc, "reason", None):
+        return exc.reason
+    return exc
+
+
+def is_tls_hostname_error(exc):
+    reason = unwrap_url_error(exc)
+    if isinstance(reason, ssl.CertificateError):
+        return True
+    text = str(reason).lower()
+    return (
+        "hostname" in text
+        or "certificate is not valid for" in text
+        or ("cn" in text and "不匹配" in text)
+        or "证书的 cn 名与传递的值不匹配" in text
+    )
+
+
+def describe_connection_error(exc):
+    if is_tls_hostname_error(exc):
+        return (
+            f"{exc}。证书域名校验失败：上游返回的证书和当前 URL 主机名不匹配。"
+            "请优先检查代理/VPN/Clash 规则、DNS 解析、公司网关或杀毒软件的 HTTPS 扫描。"
+        )
+    reason = unwrap_url_error(exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return (
+            f"{exc}。证书校验失败：请检查系统证书、代理/VPN、DNS、系统时间，"
+            "或点击“诊断”查看当前解析 IP 和证书信息。"
+        )
+    return str(exc)
+
+
+def cert_field_to_text(items):
+    parts = []
+    for group in items or []:
+        for key, value in group:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts) or "unknown"
+
+
+def cert_subject_alt_names(cert):
+    names = []
+    alt_names = cert.get("subjectAltName", ()) if isinstance(cert, dict) else ()
+    for key, value in alt_names:
+        if key.lower() == "dns":
+            names.append(value)
+    return names
+
+
+def decode_der_certificate(der_cert):
+    pem = ssl.DER_cert_to_PEM_cert(der_cert)
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="ascii", delete=False, suffix=".pem") as tmp:
+            tmp.write(pem)
+            path = tmp.name
+        return ssl._ssl._test_decode_cert(path)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def read_peer_certificate(host, port, timeout):
+    context = ssl._create_unverified_context()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+            der_cert = tls_sock.getpeercert(binary_form=True)
+    if not der_cert:
+        return {}
+    return decode_der_certificate(der_cert)
+
+
+def add_cert_summary(lines, cert):
+    if not cert:
+        lines.append("证书信息：未能读取")
+        return
+    lines.append(f"证书 Subject：{cert_field_to_text(cert.get('subject'))}")
+    lines.append(f"证书 Issuer：{cert_field_to_text(cert.get('issuer'))}")
+    if cert.get("notBefore") or cert.get("notAfter"):
+        lines.append(f"证书有效期：{cert.get('notBefore', '?')} -> {cert.get('notAfter', '?')}")
+    names = cert_subject_alt_names(cert)
+    if names:
+        preview = ", ".join(names[:10])
+        if len(names) > 10:
+            preview += f" ... (+{len(names) - 10})"
+        lines.append(f"证书 DNS 名称：{preview}")
+
+
+def diagnose_tls_endpoint(base_url, timeout=10):
+    text = (base_url or "").strip()
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urllib.parse.urlparse(text)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("无法从上游 URL 解析主机名")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    lines = [f"诊断目标：{host}:{port} ({parsed.scheme or 'https'})"]
+    proxies = urllib.request.getproxies()
+    if proxies:
+        proxy_text = ", ".join(f"{key}={value}" for key, value in sorted(proxies.items()))
+        lines.append(f"系统代理：{proxy_text}")
+    else:
+        lines.append("系统代理：未检测到")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        ips = sorted({item[4][0] for item in infos})
+        lines.append(f"DNS 解析：{', '.join(ips) if ips else '无结果'}")
+    except OSError as exc:
+        lines.append(f"DNS 解析失败：{exc}")
+
+    if parsed.scheme and parsed.scheme != "https":
+        lines.append("TLS 校验：跳过，目标不是 https")
+        return lines
+
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as tls_sock:
+                cert = tls_sock.getpeercert()
+        lines.append("TLS 校验：通过")
+        add_cert_summary(lines, cert)
+    except Exception as exc:
+        lines.append(f"TLS 校验：失败 {type(exc).__name__}: {exc}")
+        if is_tls_hostname_error(exc):
+            lines.append("判断：证书域名不匹配，通常由代理/VPN/DNS/HTTPS 扫描或上游 CDN 证书异常导致。")
+        try:
+            cert = read_peer_certificate(host, port, timeout)
+            add_cert_summary(lines, cert)
+        except Exception as cert_exc:
+            lines.append(f"证书信息读取失败：{type(cert_exc).__name__}: {cert_exc}")
+    return lines
 
 
 def strip_reasoning_content(body):
@@ -712,7 +856,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             )
             return err
         except urllib.error.URLError as err:
-            self.server.state.log(f"[{req_id}] 上游连接失败：{err}")
+            self.server.state.log(f"[{req_id}] 上游连接失败：{describe_connection_error(err)}")
             raise
 
     def send_raw(self, status, content_type, data):
@@ -953,4 +1097,3 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif isinstance(data, dict) and data_type == "error":
             summary += f", error={preview_text(json.dumps(data, ensure_ascii=False), 500)}"
         self.server.state.log(summary)
-

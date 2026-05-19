@@ -25,6 +25,8 @@ from upstreamkit_core import (
     RelayHandler,
     RelayState,
     create_tray_image,
+    describe_connection_error,
+    diagnose_tls_endpoint,
     is_startup_enabled,
     join_url,
     load_saved_config,
@@ -148,6 +150,8 @@ class RelayApp:
 
         self.test_button = ttk.Button(frame, text="测试", command=self.test_upstream)
         self.test_button.grid(row=5, column=3, sticky="e", pady=6)
+        self.diagnose_button = ttk.Button(frame, text="诊断", command=self.diagnose_upstream)
+        self.diagnose_button.grid(row=5, column=2, sticky="e", pady=6, padx=(0, 8))
 
         sep = ttk.Separator(frame)
         sep.grid(row=6, column=0, columnspan=4, sticky="ew", pady=12)
@@ -371,9 +375,29 @@ class RelayApp:
             else:
                 self.log(f"测试失败：HTTP {status} {preview}")
         except Exception as exc:
-            self.log(f"测试失败：{exc}")
+            self.log(f"测试失败：{describe_connection_error(exc)}")
         finally:
             self.root.after(0, lambda: self.test_button.configure(state=NORMAL))
+
+    def diagnose_upstream(self):
+        try:
+            config = self.read_config_from_form()
+        except Exception as exc:
+            self.log(f"诊断失败：{exc}")
+            return
+
+        self.diagnose_button.configure(state=DISABLED)
+        self.log(f"开始诊断上游连接：{config.base_url}")
+        threading.Thread(target=self.run_upstream_diagnosis, args=(config.base_url,), daemon=True).start()
+
+    def run_upstream_diagnosis(self, base_url):
+        try:
+            for line in diagnose_tls_endpoint(base_url):
+                self.log(line)
+        except Exception as exc:
+            self.log(f"诊断失败：{describe_connection_error(exc)}")
+        finally:
+            self.root.after(0, lambda: self.diagnose_button.configure(state=NORMAL))
 
     def start_server(self):
         if self.server:
