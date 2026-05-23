@@ -136,7 +136,7 @@ class TokenStatsDialog:
 
         filtered = {}
         for date_key, stats in daily_stats.items():
-            if date_key >= cutoff_str and stats.get("input_tokens", 0) > 0 or stats.get("output_tokens", 0) > 0:
+            if date_key >= cutoff_str and (stats.get("input_tokens", 0) > 0 or stats.get("output_tokens", 0) > 0):
                 filtered[date_key] = stats
         return filtered
 
