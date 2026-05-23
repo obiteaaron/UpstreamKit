@@ -377,7 +377,7 @@ class TokenStatsDialog:
         filename = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfilename=f"token_stats_{datetime.now().strftime('%Y%m%d')}.csv"
+            initialfile=f"token_stats_{datetime.now().strftime('%Y%m%d')}.csv"
         )
         if not filename:
             return
