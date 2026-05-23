@@ -104,6 +104,7 @@ def set_startup_enabled(enabled):
 CONFIG_DIR = app_dir()
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "token_stats.json")
+DAILY_TOKEN_STATS_PATH = os.path.join(CONFIG_DIR, "daily_token_stats.json")
 SSL_TRUST_SOURCE = configure_ssl_trust()
 DEFAULT_UPSTREAM = {
     "name": "默认上游",
@@ -123,6 +124,12 @@ DEFAULT_TOKEN_STATS = {
     "cache_hit_input_tokens": 0,
     "output_tokens": 0,
     "cache_known": False,
+}
+DEFAULT_DAILY_TOKEN_STATS = {
+    "version": 1,
+    "daily_stats": {},
+    "first_use_date": None,
+    "last_use_date": None,
 }
 
 
@@ -463,12 +470,46 @@ def save_token_stats(data):
         json.dump(normalize_token_stats(data), file, ensure_ascii=False, indent=2)
 
 
+def normalize_daily_token_stats(data):
+    merged = dict(DEFAULT_DAILY_TOKEN_STATS)
+    if isinstance(data, dict):
+        for key in DEFAULT_DAILY_TOKEN_STATS:
+            if key in data:
+                merged[key] = data[key]
+    return merged
+
+
+def load_daily_token_stats():
+    try:
+        if not os.path.exists(DAILY_TOKEN_STATS_PATH):
+            save_daily_token_stats(DEFAULT_DAILY_TOKEN_STATS)
+            return dict(DEFAULT_DAILY_TOKEN_STATS)
+        with open(DAILY_TOKEN_STATS_PATH, "r", encoding="utf-8") as file:
+            return normalize_daily_token_stats(json.load(file))
+    except Exception:
+        return dict(DEFAULT_DAILY_TOKEN_STATS)
+
+
+def save_daily_token_stats(data):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(DAILY_TOKEN_STATS_PATH, "w", encoding="utf-8") as file:
+        json.dump(normalize_daily_token_stats(data), file, ensure_ascii=False, indent=2)
+
+
+def get_date_key():
+    return time.strftime("%Y-%m-%d")
+
+
 def extract_usage_tokens(payload, provider=None):
     usage = None
+    model = None
     if isinstance(payload, dict):
         usage = payload.get("usage")
         if usage is None and isinstance(payload.get("message"), dict):
             usage = payload["message"].get("usage")
+            model = payload["message"].get("model")
+        if model is None:
+            model = payload.get("model")
     if not isinstance(usage, dict):
         return None
 
@@ -504,6 +545,7 @@ def extract_usage_tokens(payload, provider=None):
         "cache_hit_input_tokens": cache_hit,
         "output_tokens": output_tokens,
         "cache_known": cache_known,
+        "model": model,
     }
 
 
@@ -528,10 +570,11 @@ class RelayConfig:
 
 
 class RelayState:
-    def __init__(self, config, log_func, token_func=None):
+    def __init__(self, config, log_func, token_func=None, detailed_token_func=None):
         self.config = config
         self.log = log_func
         self.record_tokens = token_func or (lambda usage: None)
+        self.record_detailed_tokens = detailed_token_func or (lambda usage, model: None)
 
 
 def normalize_text_content(content):
@@ -881,9 +924,10 @@ class RelayHandler(BaseHTTPRequestHandler):
             event_counts = {}
             event_samples = 0
             stream_usage = dict(DEFAULT_TOKEN_STATS)
+            stream_model = None
 
             def finish_event():
-                nonlocal event_name, data_lines, event_samples, stream_usage
+                nonlocal event_name, data_lines, event_samples, stream_usage, stream_model
                 if event_name is None and not data_lines:
                     return
                 name = event_name or "message"
@@ -892,6 +936,16 @@ class RelayHandler(BaseHTTPRequestHandler):
                 usage_delta = self.usage_from_sse_data(data_text)
                 if usage_delta:
                     stream_usage = add_token_stats(stream_usage, usage_delta)
+                    if usage_delta.get("model"):
+                        stream_model = usage_delta.get("model")
+                # 从 message_start 事件提取 model
+                if name == "message_start" and not stream_model:
+                    try:
+                        data = json.loads(data_text)
+                        if isinstance(data, dict) and isinstance(data.get("message"), dict):
+                            stream_model = data["message"].get("model")
+                    except json.JSONDecodeError:
+                        pass
                 if event_samples < 12:
                     self.log_sse_event(req_id, name, data_text)
                     event_samples += 1
@@ -913,6 +967,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             finish_event()
             if stream_usage["input_tokens"] or stream_usage["output_tokens"]:
                 self.server.state.record_tokens(stream_usage)
+                self.server.state.record_detailed_tokens(stream_usage, stream_model)
                 self.server.state.log(
                     f"[{req_id}] token统计：input={stream_usage['input_tokens']}, "
                     f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
@@ -962,6 +1017,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         tool_chunks = {}
         text_index = 0
         stream_usage = dict(DEFAULT_TOKEN_STATS)
+        remote_model = None
 
         for line in response:
             if not line.startswith(b"data:"):
@@ -973,6 +1029,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 chunk = json.loads(payload.decode("utf-8"))
             except json.JSONDecodeError:
                 continue
+            # 从上游响应提取实际模型名（第一个有model的chunk）
+            if remote_model is None:
+                remote_model = chunk.get("model")
             usage_delta = extract_usage_tokens(chunk)
             if usage_delta:
                 stream_usage = add_token_stats(stream_usage, usage_delta)
@@ -1036,6 +1095,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(sse_line("message_stop", {"type": "message_stop"}))
         if stream_usage["input_tokens"] or stream_usage["output_tokens"]:
             self.server.state.record_tokens(stream_usage)
+            self.server.state.record_detailed_tokens(stream_usage, remote_model)
             self.server.state.log(
                 f"[{req_id}] token统计：input={stream_usage['input_tokens']}, "
                 f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
@@ -1049,6 +1109,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not usage_delta:
             return
         self.server.state.record_tokens(usage_delta)
+        model = usage_delta.get("model")
+        self.server.state.record_detailed_tokens(usage_delta, model)
         self.server.state.log(
             f"[{getattr(self, 'request_id', 'no-id')}] token统计："
             f"input={usage_delta['input_tokens']}, "
