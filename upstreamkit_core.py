@@ -1014,7 +1014,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         }))
 
         text_started = False
-        tool_chunks = {}
+        tool_started = {}  # 记录哪些 index 的 tool_use 已经发送了 content_block_start
         text_index = 0
         stream_usage = dict(DEFAULT_TOKEN_STATS)
         remote_model = None
@@ -1053,40 +1053,48 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "delta": {"type": "text_delta", "text": text},
                 }))
 
+            # 实时处理 tool_calls
             for call in delta.get("tool_calls") or []:
                 idx = call.get("index", 0)
-                current = tool_chunks.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if call.get("id"):
-                    current["id"] = call["id"]
                 fn = call.get("function") or {}
-                if fn.get("name"):
-                    current["name"] = fn["name"]
-                if fn.get("arguments"):
-                    current["arguments"] += fn["arguments"]
 
+                # 确定 tool_use 的 index（文本块后面）
+                tool_index = 1 if text_started else 0
+                # 如果有多个 tool，需要累计 index
+                # 使用 idx 作为临时 index，但最终需要统一
+
+                # 第一个 chunk（有 name）时发送 content_block_start
+                if fn.get("name") and idx not in tool_started:
+                    tool_started[idx] = tool_index + idx
+                    self.wfile.write(sse_line("content_block_start", {
+                        "type": "content_block_start",
+                        "index": tool_started[idx],
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call.get("id") or f"tool_{idx}",
+                            "name": fn["name"],
+                        },
+                    }))
+
+                # 每个 arguments chunk 都发送 input_json_delta
+                if fn.get("arguments") and idx in tool_started:
+                    self.wfile.write(sse_line("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": tool_started[idx],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": fn["arguments"],
+                        },
+                    }))
+
+        # 发送 content_block_stop
         if text_started:
             self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": text_index}))
 
-        next_index = 1 if text_started else 0
-        for item in tool_chunks.values():
-            try:
-                args = json.loads(item["arguments"] or "{}")
-            except json.JSONDecodeError:
-                args = {"_raw": item["arguments"]}
-            self.wfile.write(sse_line("content_block_start", {
-                "type": "content_block_start",
-                "index": next_index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": item["id"] or f"call_{next_index}",
-                    "name": item["name"],
-                    "input": args,
-                },
-            }))
-            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": next_index}))
-            next_index += 1
+        for idx in sorted(tool_started.keys()):
+            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": tool_started[idx]}))
 
-        stop_reason = "tool_use" if tool_chunks else "end_turn"
+        stop_reason = "tool_use" if tool_started else "end_turn"
         self.wfile.write(sse_line("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -1101,7 +1109,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
                 f"output={stream_usage['output_tokens']}"
             )
-        self.server.state.log(f"[{req_id}] OpenAI 流式转换结束，tool_calls={len(tool_chunks)}, text_started={text_started}")
+        self.server.state.log(f"[{req_id}] OpenAI 流式转换结束，tool_calls={len(tool_started)}, text_started={text_started}")
         self.close_connection = True
 
     def record_usage_from_payload(self, payload):
