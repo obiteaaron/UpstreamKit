@@ -41,7 +41,7 @@ class TokenStatsDialog:
 
         # 状态变量
         self.current_view = StringVar(value="overview")
-        self.time_range = IntVar(value=0)  # 0=all, 30=30days, 7=7days
+        self.time_range = IntVar(value=7)  # 30=30days, 7=7days
 
         self.build_ui()
         self.refresh_data()

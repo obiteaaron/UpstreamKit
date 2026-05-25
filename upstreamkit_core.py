@@ -1013,9 +1013,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             },
         }))
 
-        text_started = False
-        tool_started = {}  # 记录哪些 index 的 tool_use 已经发送了 content_block_start
-        text_index = 0
+        text_index = None
+        next_block_index = 0
+        tool_blocks = {}
         stream_usage = dict(DEFAULT_TOKEN_STATS)
         remote_model = None
 
@@ -1040,8 +1040,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             delta = choice.get("delta", {})
             text = delta.get("content") or ""
             if text:
-                if not text_started:
-                    text_started = True
+                if text_index is None:
+                    text_index = next_block_index
+                    next_block_index += 1
                     self.wfile.write(sse_line("content_block_start", {
                         "type": "content_block_start",
                         "index": text_index,
@@ -1057,44 +1058,67 @@ class RelayHandler(BaseHTTPRequestHandler):
             for call in delta.get("tool_calls") or []:
                 idx = call.get("index", 0)
                 fn = call.get("function") or {}
+                tool = tool_blocks.setdefault(idx, {
+                    "block_index": None,
+                    "id": "",
+                    "name": "",
+                    "pending_arguments": [],
+                })
+                if call.get("id"):
+                    tool["id"] = call["id"]
+                if fn.get("name"):
+                    tool["name"] = fn["name"]
 
-                # 确定 tool_use 的 index（文本块后面）
-                tool_index = 1 if text_started else 0
-                # 如果有多个 tool，需要累计 index
-                # 使用 idx 作为临时 index，但最终需要统一
-
-                # 第一个 chunk（有 name）时发送 content_block_start
-                if fn.get("name") and idx not in tool_started:
-                    tool_started[idx] = tool_index + idx
+                if tool["name"] and tool["block_index"] is None:
+                    tool["block_index"] = next_block_index
+                    next_block_index += 1
                     self.wfile.write(sse_line("content_block_start", {
                         "type": "content_block_start",
-                        "index": tool_started[idx],
+                        "index": tool["block_index"],
                         "content_block": {
                             "type": "tool_use",
-                            "id": call.get("id") or f"tool_{idx}",
-                            "name": fn["name"],
+                            "id": tool["id"] or f"tool_{idx}",
+                            "name": tool["name"],
+                            "input": {},
                         },
                     }))
+                    for pending in tool["pending_arguments"]:
+                        self.wfile.write(sse_line("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": tool["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": pending,
+                            },
+                        }))
+                    tool["pending_arguments"] = []
 
-                # 每个 arguments chunk 都发送 input_json_delta
-                if fn.get("arguments") and idx in tool_started:
-                    self.wfile.write(sse_line("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": tool_started[idx],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": fn["arguments"],
-                        },
-                    }))
+                arguments = fn.get("arguments")
+                if arguments:
+                    if tool["block_index"] is None:
+                        tool["pending_arguments"].append(arguments)
+                    else:
+                        self.wfile.write(sse_line("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": tool["block_index"],
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": arguments,
+                            },
+                        }))
 
-        # 发送 content_block_stop
-        if text_started:
-            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": text_index}))
-
-        for idx in sorted(tool_started.keys()):
-            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": tool_started[idx]}))
-
-        stop_reason = "tool_use" if tool_started else "end_turn"
+        block_indexes = []
+        if text_index is not None:
+            block_indexes.append(text_index)
+        block_indexes.extend(
+            tool["block_index"]
+            for tool in tool_blocks.values()
+            if tool.get("block_index") is not None
+        )
+        for block_index in sorted(block_indexes):
+            self.wfile.write(sse_line("content_block_stop", {"type": "content_block_stop", "index": block_index}))
+        tool_count = sum(1 for tool in tool_blocks.values() if tool.get("block_index") is not None)
+        stop_reason = "tool_use" if tool_count else "end_turn"
         self.wfile.write(sse_line("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
@@ -1109,7 +1133,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 f"cache_hit={stream_usage['cache_hit_input_tokens']}, "
                 f"output={stream_usage['output_tokens']}"
             )
-        self.server.state.log(f"[{req_id}] OpenAI 流式转换结束，tool_calls={len(tool_started)}, text_started={text_started}")
+        self.server.state.log(f"[{req_id}] OpenAI 流式转换结束，tool_calls={tool_count}, text_started={text_index is not None}")
         self.close_connection = True
 
     def record_usage_from_payload(self, payload):
