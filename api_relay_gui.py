@@ -19,6 +19,8 @@ from upstreamkit_core import (
     DEFAULT_PORT,
     DEFAULT_TOKEN_STATS,
     DEFAULT_UPSTREAM,
+    DAILY_TOKEN_STATS_PATH,
+    DEFAULT_DAILY_TOKEN_STATS,
     SSL_TRUST_SOURCE,
     TOKEN_STATS_PATH,
     RelayConfig,
@@ -31,6 +33,8 @@ from upstreamkit_core import (
     join_url,
     load_saved_config,
     load_token_stats,
+    load_daily_token_stats,
+    save_daily_token_stats,
     normalize_token_stats,
     post_json,
     save_config_data,
@@ -38,9 +42,11 @@ from upstreamkit_core import (
     set_startup_enabled,
     add_token_stats,
     now_text,
+    get_date_key,
     winreg,
 )
 from upstreamkit_dialogs import UpstreamEditDialog
+from token_stats_dialog import TokenStatsDialog
 
 
 class RelayApp:
@@ -82,6 +88,9 @@ class RelayApp:
         self.session_tokens = dict(DEFAULT_TOKEN_STATS)
         self.total_tokens = load_token_stats()
         self.token_lock = threading.Lock()
+        self.daily_stats = load_daily_token_stats()
+        self.detailed_token_lock = threading.Lock()
+        self.session_models = {}  # 本次会话分模型统计
         self.session_token_var = StringVar()
         self.total_token_var = StringVar()
 
@@ -167,7 +176,8 @@ class RelayApp:
         ttk.Label(frame, textvariable=self.session_token_var).grid(row=9, column=1, columnspan=3, sticky="w", pady=(10, 2))
 
         ttk.Label(frame, text="总计token：").grid(row=10, column=0, sticky="nw", pady=2)
-        ttk.Label(frame, textvariable=self.total_token_var).grid(row=10, column=1, columnspan=3, sticky="w", pady=2)
+        ttk.Label(frame, textvariable=self.total_token_var).grid(row=10, column=1, columnspan=2, sticky="w", pady=2)
+        ttk.Button(frame, text="统计详情", command=self.show_token_stats_dialog).grid(row=10, column=3, sticky="e", pady=2)
 
         ttk.Label(frame, text="日志").grid(row=11, column=0, sticky="nw", pady=(14, 6))
         log_frame = ttk.Frame(frame)
@@ -301,6 +311,75 @@ class RelayApp:
                 self.log(f"保存 token 统计失败：{exc}")
         self.root.after(0, self.update_token_labels)
 
+    def record_detailed_token_usage(self, usage_delta, model=None):
+        """记录每日和分模型的详细统计"""
+        if not usage_delta:
+            return
+        date_key = get_date_key()
+        model_key = model or "unknown"
+        # 简化模型名（去掉日期后缀等）
+        if model_key and "-" in model_key:
+            # 尝试识别 claude-xxx 格式
+            parts = model_key.split("-")
+            if len(parts) >= 2 and parts[0] in ("claude", "gpt"):
+                # 保留前两部分作为简化名
+                model_key = f"{parts[0]}-{parts[1]}"
+        with self.detailed_token_lock:
+            # 更新本次会话的分模型统计
+            if model_key not in self.session_models:
+                self.session_models[model_key] = {
+                    "input_tokens": 0,
+                    "cache_miss_input_tokens": 0,
+                    "cache_hit_input_tokens": 0,
+                    "output_tokens": 0,
+                    "request_count": 0,
+                }
+            model_stats = self.session_models[model_key]
+            model_stats["input_tokens"] += usage_delta.get("input_tokens", 0)
+            model_stats["cache_miss_input_tokens"] += usage_delta.get("cache_miss_input_tokens", 0)
+            model_stats["cache_hit_input_tokens"] += usage_delta.get("cache_hit_input_tokens", 0)
+            model_stats["output_tokens"] += usage_delta.get("output_tokens", 0)
+            model_stats["request_count"] += 1
+
+            # 更新每日统计
+            self.daily_stats = load_daily_token_stats()
+            daily_stats = self.daily_stats.get("daily_stats", {})
+            day_stats = daily_stats.setdefault(date_key, {
+                "input_tokens": 0,
+                "cache_miss_input_tokens": 0,
+                "cache_hit_input_tokens": 0,
+                "output_tokens": 0,
+                "request_count": 0,
+                "models": {},
+            })
+            # 累加日统计
+            day_stats["input_tokens"] += usage_delta.get("input_tokens", 0)
+            day_stats["cache_miss_input_tokens"] += usage_delta.get("cache_miss_input_tokens", 0)
+            day_stats["cache_hit_input_tokens"] += usage_delta.get("cache_hit_input_tokens", 0)
+            day_stats["output_tokens"] += usage_delta.get("output_tokens", 0)
+            day_stats["request_count"] += 1
+            # 累加模型统计
+            model_day_stats = day_stats["models"].setdefault(model_key, {
+                "input_tokens": 0,
+                "cache_miss_input_tokens": 0,
+                "cache_hit_input_tokens": 0,
+                "output_tokens": 0,
+                "request_count": 0,
+            })
+            model_day_stats["input_tokens"] += usage_delta.get("input_tokens", 0)
+            model_day_stats["cache_miss_input_tokens"] += usage_delta.get("cache_miss_input_tokens", 0)
+            model_day_stats["cache_hit_input_tokens"] += usage_delta.get("cache_hit_input_tokens", 0)
+            model_day_stats["output_tokens"] += usage_delta.get("output_tokens", 0)
+            model_day_stats["request_count"] += 1
+            # 更新日期范围
+            if not self.daily_stats.get("first_use_date"):
+                self.daily_stats["first_use_date"] = date_key
+            self.daily_stats["last_use_date"] = date_key
+            try:
+                save_daily_token_stats(self.daily_stats)
+            except Exception as exc:
+                self.log(f"保存每日 token 统计失败：{exc}")
+
     def toggle_server(self):
         if self.server:
             self.stop_server()
@@ -405,7 +484,7 @@ class RelayApp:
         try:
             self.save_config()
             config = self.read_config_from_form()
-            state = RelayState(config, self.log, self.record_token_usage)
+            state = RelayState(config, self.log, self.record_token_usage, self.record_detailed_token_usage)
             server = ThreadingHTTPServer(("127.0.0.1", config.port), RelayHandler)
             server.state = state
             self.server = server
@@ -432,6 +511,10 @@ class RelayApp:
         self.run_button.configure(text="运行")
         self.update_running_controls()
         self.log("已停止")
+
+    def show_token_stats_dialog(self):
+        """打开统计详情弹窗"""
+        TokenStatsDialog(self.root, self)
 
     def on_close(self):
         self.hide_to_tray()
